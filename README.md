@@ -3,6 +3,15 @@
 A Redis-backed job worker on Kubernetes that KEDA scales from zero while jobs
 are queued, and that doesn't lose jobs when it scales back down.
 
+**Quick start** (the finished assignment, about 2.5 minutes from nothing):
+
+```bash
+./deploy/deploy.sh                 # kind cluster + KEDA + everything from Parts 1-3 + reaper
+./scripts/producer.sh 100          # push 100 jobs
+./scripts/check.sh --wait          # PASS once done == 100 and nothing is left in processing
+./scripts/teardown.sh              # delete the cluster
+```
+
 ## Layout
 
 Shared tooling lives at the top level. Each part of the assignment has its own
@@ -12,7 +21,7 @@ directory. Part 1 is the base; later parts only contain overrides on top of it.
 kind/cluster.yaml                  kind cluster: 1 control-plane + 2 workers
 scripts/setup.sh                   create cluster, install KEDA (Helm), create 'ingest' namespace
 scripts/teardown.sh                delete the cluster
-scripts/producer.sh                push N unique job IDs onto 'jobs' (--mode exec|pod)
+scripts/producer.sh                push N unique job IDs onto 'jobs' (--mode exec|pod, --append)
 scripts/producer-core.sh           the push logic, run inside a container by producer.sh
 scripts/check.sh                   verify a run: done == N, 'jobs' and 'processing' empty
 scripts/lib.sh                     shared redis-cli-over-kubectl-exec helper
@@ -30,7 +39,27 @@ part-2-autoscale/manifests/        overrides on Part 1
   kustomization.yaml               Part 1 + the files below; drops the worker's fixed replicas
   triggerauthentication.yaml       KEDA gets the Redis password from the redis-auth Secret
   scaledobject.yaml                redis list trigger on 'jobs', 0-10 replicas
+
+part-3-completion/                 overrides on Part 2
+  manifests/kustomization.yaml     swaps in the fixed worker script, explicit 30s grace period
+  worker/worker.sh                 worker with graceful shutdown + atomic completion
+  scripts/scale-down-test.sh       100 jobs, with work still arriving while KEDA scales down
+
+bonus-reaper/                      overrides on Part 3
+  manifests/kustomization.yaml     Part 3 + reaper CronJob + generated reaper-script ConfigMap
+  manifests/reaper.yaml            CronJob: every minute, re-queue jobs stuck in 'processing'
+  reaper/reap.lua                  the atomic re-queue logic
+  scripts/crash-test.sh            SIGKILL a worker mid-job, watch the reaper recover it
+
+deploy/                            the finished assignment in one step
+  all-in-one.yaml                  rendered from bonus-reaper/manifests (Parts 1-3 + reaper)
+  render.sh                        regenerate all-in-one.yaml after changing any part
+  deploy.sh                        setup.sh + Secret + apply all-in-one.yaml
 ```
+
+To deploy one part on its own, run
+`./part-1-deploy/scripts/deploy.sh <part>/manifests`. Each overlay includes
+the parts before it.
 
 ## Prerequisites
 
@@ -50,6 +79,8 @@ part-2-autoscale/manifests/        overrides on Part 1
 ./part-1-deploy/scripts/deploy.sh   # redis-auth Secret + Redis + worker in ns 'ingest'
 ```
 
+Or, for the finished assignment in one step: `./deploy/deploy.sh`.
+
 Override `CLUSTER_NAME` or `KEDA_VERSION` via env vars. Both scripts are
 idempotent.
 
@@ -66,7 +97,9 @@ unique within and across runs. One `MULTI`/`EXEC` pushes the jobs and also reset
 `done=0`, sets `expected=N` and sets `run_id`, so the checker always compares
 against the latest run. The producer refuses to start if `jobs` or
 `processing` still hold entries from an earlier run, because leftovers would
-make `done == N` meaningless. `--force` overrides this.
+make `done == N` meaningless. `--force` overrides this. `--append` adds jobs to
+the current run instead (`expected += N`, `done` is not reset). Part 3 uses it
+to keep work arriving mid-run.
 
 **Check:** passes when `done == expected`, `jobs` is empty and `processing` is
 empty. On failure it lists the job IDs stuck in `processing`. `--wait [secs]`
@@ -254,6 +287,235 @@ as `bash` PID 1, which ignores SIGTERM, so they kept looping until the kubelet
 SIGKILLed them at the end of the 30s grace period. Here the queue had already
 drained before the kills, so nothing was lost. Part 3 shows what happens when it
 hasn't.
+
+## Part 3: Don't lose jobs
+
+```bash
+./part-1-deploy/scripts/deploy.sh part-2-autoscale/manifests    # stub worker
+./part-3-completion/scripts/scale-down-test.sh evidence/trace.txt   # FAIL
+./part-1-deploy/scripts/deploy.sh part-3-completion/manifests   # fixed worker
+./part-3-completion/scripts/scale-down-test.sh evidence/trace.txt   # PASS
+```
+
+### 1. What happens with the stub as given?
+
+**What the stub does on scale-down.** The stub runs as `bash` PID 1 in its
+container and doesn't install a signal handler. The kernel doesn't deliver
+signals with the default action to PID 1, so **it ignores the SIGTERM** the
+kubelet sends when KEDA/the HPA scales the Deployment down. The pod shows as
+Terminating, but the loop keeps taking new jobs with `BLMOVE`. After
+`terminationGracePeriodSeconds` (30s) the kubelet SIGKILLs it. If it holds a job
+at that moment, the job is already in `processing` and is never removed or
+counted. Nothing ever looks at `processing` again, so it is lost for good.
+
+**A single burst of 100 jobs hid this.** With 100 jobs pushed at once, KEDA
+scaled 10 → 6 → 1 → 0 mid-run, and the check still passed
+([evidence/part3-before-replicas-100.txt](evidence/part3-before-replicas-100.txt)).
+The Terminating pods kept working, the queue was empty before their 30s ran
+out, and every pod was idle when it was SIGKILLed. So the stub is only safe by
+accident: the kill happens to land after the work runs out.
+
+**Reproducing the loss.**
+[scale-down-test.sh](part-3-completion/scripts/scale-down-test.sh) keeps the
+total at 100 jobs but models bursty traffic:
+1. Push 40 jobs.
+2. The moment KEDA starts scaling down, append 10 jobs every 5s (`producer.sh --append`).
+
+With the stub
+([trace](evidence/part3-before-trace.txt), [check](evidence/part3-before-check.txt)),
+a scaled-down pod was still taking jobs when its grace period ended:
+
+```
+time       t+s  spec ready  pods  jobs processing  done
+07:32:06    20     5     5     5    22          5    13
+07:32:10    24     4     4     5    27          5    18   <- scale-down: 1 pod Terminating, still working
+07:32:40    54     6     6     6    25          7    68   <- ~30s later: SIGKILL (pods 7 -> 6) mid-job
+07:33:04    78     1     1     6     0          1    99
+07:33:56   130     0     0     0     0          1    99   <- scaled to zero; the job never comes back
+run=r20260926T073150067 expected=100 done=99 jobs=0 processing=1
+FAIL: done (99) != expected (100)
+FAIL: 1 jobs stuck in processing:
+  r20260926T073219475-00006
+```
+
+**Two more problems in the stub:**
+- **`redis-cli` prints server errors to stdout with exit code 0.** If Redis
+  answers `NOAUTH Authentication required.`, that text becomes `$job`. The
+  stub then "processes" it and increments `done` for a job that never existed.
+- **`LREM` and `INCR` are two separate commands.** A kill between them leaves
+  a removed job that is never counted.
+
+### 2. The fix
+
+[part-3-completion/worker/worker.sh](part-3-completion/worker/worker.sh):
+
+1. **Graceful shutdown.** `trap ... TERM` sets a flag.
+   - Bash runs the trap when the current foreground command returns. So a job
+     in hand is always finished and completed first, and then the loop exits
+     instead of taking another job.
+   - `BLMOVE` now blocks for only 2s, so an idle worker notices SIGTERM quickly.
+   - Worst-case shutdown time is about 2s + 5s + the completion call, well within
+     the grace period. The overlay sets it to 30s explicitly
+     ([kustomization.yaml](part-3-completion/manifests/kustomization.yaml)),
+     with a comment that it must stay above the longest job.
+2. **Atomic completion.** Removing the job from `processing` and `INCR done` are
+   now a single Lua `EVAL`, so a kill can't split them.
+   - If the job isn't in `processing`, because the bonus reaper already
+     re-queued it, the script removes it from `jobs` instead.
+   - It counts the job only if a copy was found. So a job run twice is still
+     counted once.
+3. **Errors are errors.** `redis-cli -e` makes error replies exit non-zero:
+   - A failed `BLMOVE` is retried instead of being treated as a job.
+   - A failed completion is retried until Redis confirms it.
+4. The password is passed via `REDISCLI_AUTH` instead of `-a`, so it's not in
+   the process list.
+
+**After the fix**, with the identical test
+([trace](evidence/part3-after-trace.txt), [check](evidence/part3-after-check.txt)).
+Scaled-down pods now leave within one sample, about 3s, instead of 30s:
+
+```
+time       t+s  spec ready  pods  jobs processing  done
+07:34:36    24     5     5     5    19          5    16
+07:34:40    28     4     4     5    24          5    21   <- scale-down: 1 pod Terminating
+07:34:43    31     4     4     4    19          4    27   <- ...finished its job and exited
+07:35:24    72     2     2     6     6          5    89
+07:35:28    76     2     2     2     4          2    94   <- 4 pods drained and gone within ~3s
+07:36:09   117     0     0     0     0          0   100
+run=r20260926T073416642 expected=100 done=100 jobs=0 processing=0
+PASS
+```
+
+What a scaled-down worker logs ([evidence/part3-after-shutdown-logs.txt](evidence/part3-after-shutdown-logs.txt)):
+
+```
+07:36:52 worker-96b596f77-625bl done r20260926T073626656-00019
+07:36:57 worker-96b596f77-625bl SIGTERM: finishing current job, then exiting
+07:36:57 worker-96b596f77-625bl done r20260926T073626656-00023
+07:36:57 worker-96b596f77-625bl exiting cleanly
+```
+
+The `SIGTERM` line is printed when the trap runs, which is once the job's
+`sleep` returns. That's why it has the same timestamp as the last `done`.
+
+### What failure cases does the fix not cover?
+
+The fix only handles **graceful** termination: SIGTERM followed by enough
+time to finish. A job still ends up stranded in `processing` if the worker
+dies without that:
+
+| Failure | Why the fix doesn't help | Covered by the reaper? |
+|---------|--------------------------|------------------------|
+| **OOM kill, or any SIGKILL** | No SIGTERM, so the trap never runs. `kubectl delete --force --grace-period=0` does *not* cause this: the kubelet still sends SIGTERM and waits for the grace period. | yes |
+| **Node failure / kernel panic / VM loss** | The process just stops. | yes |
+| **Job outlives the grace period** (a real job taking more than 30s, or Redis unreachable while completing) | The kubelet SIGKILLs mid-job or mid-retry. | yes |
+| **Container crash** (bug, `set -u` violation, etc.) | Same as SIGKILL. | yes |
+| **Redis itself restarts** | Persistence is off, so `jobs`, `processing` and `done` all vanish. | **no**, needs AOF + a PVC, or a durable queue |
+| **Redis failover** (if replicated) | Async replication can drop the last writes. | **no** |
+| **Duplicate execution** | After a re-queue (or a network error after a successful `BLMOVE`), a job can run twice. This is at-least-once delivery: `done` stays correct, but job side effects must be idempotent. | n/a, this is inherent |
+| **Poison jobs** | A job that always crashes its worker is re-queued forever. There's no attempt count or dead-letter list. | **no** |
+| **Jobs lost before `BLMOVE`** | The producer's `MULTI`/`EXEC` is all-or-nothing, but a producer crash before `EXEC` loses that batch. | **no**, the producer should retry |
+
+## Bonus: reaper CronJob
+
+**Choice: the reaper, not a ScaledJob.** Part 3 asks what the fix doesn't
+cover. The honest answer is "any death without a graceful shutdown", which is
+the most common way workers die in production: OOM kills, node loss, evictions
+past the grace period. The reaper closes that gap. It is the recovery half of
+the reliable-queue pattern the stub half-implements with `BLMOVE` to
+`processing`. Without a reaper, `processing` is a record of what was lost, not
+a way to get it back.
+
+A ScaledJob is a valid design, but it's a *different* way to avoid scale-down
+kills: every job gets its own pod, which KEDA never terminates. It doesn't help
+with OOM or node loss either, and a Job pod that dies after `BLMOVE` strands its
+job in `processing` just the same. It trades the problem rather than solving
+it, and adds a pod start (~2s) to every 2-5s job.
+
+The reaper design also forces the questions that show whether the system is
+really correct:
+- **Clock skew.** Whose clock decides a job is stuck? The reaper uses Redis
+  `TIME`, so there's a single clock.
+- **Deaths between steps.** What if a worker dies between `BLMOVE` and
+  recording a claim time? The workers record nothing; the reaper stamps a job
+  the first time *it* sees it in `processing`.
+- **Races.** What if the reaper re-queues a job just as a slow worker finishes
+  it? The reap is one atomic Lua script. The worker's completion script
+  removes the other copy and counts the job only once.
+- **Choosing the timeout.** It must be above the longest job, or live jobs get
+  duplicated.
+
+**How it works** ([bonus-reaper/reaper/reap.lua](bonus-reaper/reaper/reap.lua),
+[reaper.yaml](bonus-reaper/manifests/reaper.yaml)):
+- The CronJob runs every minute with `concurrencyPolicy: Forbid`, using the
+  same ConfigMap/Secret as the worker.
+- Each run is one atomic `EVAL`:
+  1. Stamp every job in `processing` that isn't yet in the `reaper:seen` hash
+     with the current Redis time.
+  2. Re-queue with `LPUSH` (so it's next to be taken) any job stamped at least
+     `REAP_AFTER_SECONDS` (45s) ago.
+  3. Remove stamps for jobs that have since completed.
+- With a 1-minute schedule, a stranded job is re-queued 1-2 minutes after its
+  worker died. KEDA then sees `jobs` > 0 and scales a worker up if it was at 0.
+- The workers need no changes for this.
+
+**Evidence** ([evidence/bonus-reaper-crash-test.txt](evidence/bonus-reaper-crash-test.txt),
+produced by [crash-test.sh](bonus-reaper/scripts/crash-test.sh)). A worker's
+process is SIGKILLed from its kind node mid-job, which is exactly what an OOM
+kill does:
+
+```
+07:40:57 pushed 20 jobs (run r20260926T074057430) via 127.0.0.1; jobs=19
+07:40:57 in processing: r20260926T074057430-00001
+07:40:57 SIGKILL worker process of worker-96b596f77-pxkf5 on node keda-redis-worker (like an OOM kill)
+--- after the queue drains, before the reaper:
+run=r20260926T074057430 expected=20 done=19 jobs=0 processing=1
+FAIL: done (19) != expected (20)
+FAIL: 1 jobs stuck in processing:
+  r20260926T074057430-00001
+--- waiting for the reaper (runs every minute, re-queues after REAP_AFTER_SECONDS=45):
+[pod/reaper-29840142-x28jk/reaper] 07:42:00 re-queued:
+[pod/reaper-29840142-x28jk/reaper] r20260926T074057430-00001
+run=r20260926T074057430 expected=20 done=20 jobs=0 processing=0
+PASS
+```
+
+The 07:41 pass stamped the job, and the 07:42 pass re-queued it. KEDA started
+a worker, which finished it.
+
+My first version of this test used `kubectl delete pod --force
+--grace-period=0`, and **no job was lost**. That only removes the API object;
+the kubelet still sends SIGTERM and honours the grace period, which the Part 3
+worker handles. A test that doesn't actually produce the failure would have
+"proved" the reaper by accident, so the test now kills the process on the node.
+
+## What I'd do with more time
+
+- **Durability:** turn on Redis AOF (`appendfsync everysec`) with a PVC, or
+  move to Redis Streams. Streams have consumer groups with a per-message
+  pending list, delivery counts and `XAUTOCLAIM`, which are a built-in reaper.
+  Alternatively, use a queue built for this (SQS, RabbitMQ with manual acks).
+- **Poison jobs:** keep an attempt counter per job in the reaper. After N
+  re-queues, move the job to a `dead` list and alert.
+- **Heartbeats instead of a fixed timeout:** have workers refresh a per-job
+  lease (`SET lease:<job> <worker> EX 15`). The reaper then re-queues when the
+  lease expires, which suits long jobs without a large global timeout. It also
+  means the reaper could run as a small always-on loop instead of a 1-minute
+  CronJob.
+- **Scale on `jobs + processing`:** the trigger ignores in-flight work, which is
+  why KEDA scales down while every worker is busy. A second trigger on
+  `processing` (or on the sum) would keep capacity until work actually finishes.
+- **ScaledJob comparison:** implement it and run the same tests. It would be
+  useful for long, uneven jobs, where one pod per job is worth the start-up
+  cost.
+- **Metrics and alerts:** queue depth, oldest job age, the rate of re-queued and
+  duplicate jobs, and worker restarts, exported for Prometheus.
+- **Hardening:** a real worker image with a proper client (retries, timeouts)
+  instead of bash + `redis-cli`; `securityContext` (non-root, read-only root
+  filesystem); a NetworkPolicy so only the workers, the reaper and KEDA can
+  reach Redis; TLS to Redis; a PodDisruptionBudget for Redis.
+- **CI:** run `deploy/deploy.sh`, `scale-down-test.sh` and `crash-test.sh` in a
+  kind-based pipeline, so the evidence is regenerated on every change.
 
 ## Tear down
 

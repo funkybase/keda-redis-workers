@@ -1,5 +1,5 @@
 #!/bin/bash
-# Usage (inside a redis:7 container): producer-core.sh N RUN_ID FORCE
+# Usage (inside a redis:7 container): producer-core.sh N RUN_ID [--force|--append]
 #
 # The actual push logic. producer.sh streams this script into a container
 # (`bash -s`), either the Redis pod itself or a one-off producer pod, so both
@@ -7,7 +7,7 @@
 # 127.0.0.1 (i.e. when running inside the Redis pod).
 set -euo pipefail
 
-N="$1" RUN_ID="$2" FORCE="$3"
+N="$1" RUN_ID="$2" OPT="${3:-}"
 export REDISCLI_AUTH="$REDIS_PASSWORD"
 
 # stdin is this script (bash -s), so keep redis-cli from reading it.
@@ -15,7 +15,7 @@ r() { redis-cli -h "${REDIS_HOST:-127.0.0.1}" --no-auth-warning "$@" </dev/null;
 
 queued=$(r LLEN jobs)
 inflight=$(r LLEN processing)
-if [ "$FORCE" != "--force" ] && { [ "$queued" -ne 0 ] || [ "$inflight" -ne 0 ]; }; then
+if [ -z "$OPT" ] && { [ "$queued" -ne 0 ] || [ "$inflight" -ne 0 ]; }; then
   echo "refusing: jobs=$queued processing=$inflight from a previous run (use --force)" >&2
   exit 1
 fi
@@ -24,9 +24,14 @@ CHUNK=500 # IDs per RPUSH, keeps each command line a sane size
 
 {
   echo "MULTI"
-  echo "SET done 0"
-  echo "SET expected $N"
-  echo "SET run_id $RUN_ID"
+  if [ "$OPT" = "--append" ]; then
+    # Add to the current run: 'expected' grows, 'done' keeps counting.
+    echo "INCRBY expected $N"
+  else
+    echo "SET done 0"
+    echo "SET expected $N"
+    echo "SET run_id $RUN_ID"
+  fi
   for ((start = 1; start <= N; start += CHUNK)); do
     end=$((start + CHUNK - 1)); ((end > N)) && end=$N
     printf 'RPUSH jobs'

@@ -1,0 +1,65 @@
+# Every minute, re-queue jobs that have sat in 'processing' for at least
+# REAP_AFTER_SECONDS across reaper passes (see ../reaper/reap.lua). With a
+# 1-minute schedule a stuck job goes back on 'jobs' 1-2 minutes after its
+# worker died. KEDA then sees a non-empty queue and wakes a worker if needed.
+#
+# REAP_AFTER_SECONDS must be well above the longest legitimate job (5s here),
+# or slow-but-alive jobs get run twice. The worker's completion script makes
+# sure a job run twice is still only counted once.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: reaper
+spec:
+  schedule: "* * * * *"
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 30
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 30
+      template:
+        metadata:
+          labels:
+            app: reaper
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: reaper
+              image: redis:7
+              env:
+                - name: REDIS_HOST
+                  valueFrom:
+                    configMapKeyRef:
+                      name: worker-config
+                      key: REDIS_HOST
+                - name: REDISCLI_AUTH
+                  valueFrom:
+                    secretKeyRef:
+                      name: redis-auth
+                      key: password
+                - name: REAP_AFTER_SECONDS
+                  value: "45"
+              command: ["sh", "-c"]
+              args:
+                - |
+                  echo "$(date -u +%H:%M:%S) re-queued:"
+                  exec redis-cli -e -h "$REDIS_HOST" --no-auth-warning \
+                    EVAL "$(cat /scripts/reap.lua)" 3 processing jobs reaper:seen "$REAP_AFTER_SECONDS"
+              volumeMounts:
+                - name: scripts
+                  mountPath: /scripts
+                  readOnly: true
+              resources:
+                requests:
+                  cpu: 10m
+                  memory: 16Mi
+                limits:
+                  cpu: 100m
+                  memory: 64Mi
+          volumes:
+            - name: scripts
+              configMap:
+                name: reaper-script

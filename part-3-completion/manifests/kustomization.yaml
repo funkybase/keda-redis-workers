@@ -1,0 +1,28 @@
+# Part 3 = Part 2 + a worker that doesn't lose jobs on scale-down.
+# Only the overrides live here.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: ingest
+
+resources:
+  - ../../part-2-autoscale/manifests
+
+# Swap in the fixed worker script. The new content hash renames the ConfigMap,
+# which rolls the worker Deployment.
+configMapGenerator:
+  - name: worker-script
+    behavior: replace
+    files:
+      - worker.sh=../worker/worker.sh
+
+patches:
+  # Worst case from SIGTERM to exit: up to 2s in BLMOVE + up to 5s of work +
+  # the completion call. 30s (the default, made explicit here) leaves plenty
+  # of margin. It must stay above the longest job, or SIGKILL lands mid-job.
+  - target:
+      kind: Deployment
+      name: worker
+    patch: |-
+      - op: add
+        path: /spec/template/spec/terminationGracePeriodSeconds
+        value: 30

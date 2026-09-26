@@ -1,0 +1,10 @@
+[pod/worker-96b596f77-625bl/worker] 07:36:52 worker-96b596f77-625bl done r20260926T073626656-00019
+[pod/worker-96b596f77-625bl/worker] 07:36:57 worker-96b596f77-625bl SIGTERM: finishing current job, then exiting
+[pod/worker-96b596f77-625bl/worker] 07:36:57 worker-96b596f77-625bl done r20260926T073626656-00023
+[pod/worker-96b596f77-625bl/worker] 07:36:57 worker-96b596f77-625bl exiting cleanly
+
+[pod/worker-96b596f77-7lb72/worker] 07:36:53 worker-96b596f77-7lb72 done r20260926T073626656-00020
+[pod/worker-96b596f77-7lb72/worker] 07:36:57 worker-96b596f77-7lb72 SIGTERM: finishing current job, then exiting
+[pod/worker-96b596f77-7lb72/worker] 07:36:57 worker-96b596f77-7lb72 done r20260926T073626656-00026
+[pod/worker-96b596f77-7lb72/worker] 07:36:57 worker-96b596f77-7lb72 exiting cleanly
+

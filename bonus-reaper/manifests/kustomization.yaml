@@ -1,0 +1,14 @@
+# Bonus = Part 3 + a reaper CronJob that re-queues jobs stuck in 'processing'.
+# Only the additions live here.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: ingest
+
+resources:
+  - ../../part-3-completion/manifests
+  - reaper.yaml
+
+configMapGenerator:
+  - name: reaper-script
+    files:
+      - reap.lua=../reaper/reap.lua

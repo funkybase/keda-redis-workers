@@ -1,0 +1,12 @@
+07:31:50 pushed 40 jobs (run r20260926T073150067) via 127.0.0.1; jobs=40
+07:32:09 KEDA scaling down: 5 -> 4 replicas; appending jobs while pods terminate
+07:32:09 pushed 10 jobs (run r20260926T073209200) via 127.0.0.1; jobs=27
+07:32:14 pushed 10 jobs (run r20260926T073214360) via 127.0.0.1; jobs=32
+07:32:19 pushed 10 jobs (run r20260926T073219475) via 127.0.0.1; jobs=36
+07:32:24 pushed 10 jobs (run r20260926T073224590) via 127.0.0.1; jobs=37
+07:32:29 pushed 10 jobs (run r20260926T073229734) via 127.0.0.1; jobs=36
+07:32:35 pushed 10 jobs (run r20260926T073234891) via 127.0.0.1; jobs=36
+run=r20260926T073150067 expected=100 done=99 jobs=0 processing=1
+FAIL: done (99) != expected (100)
+FAIL: 1 jobs stuck in processing:
+  r20260926T073219475-00006

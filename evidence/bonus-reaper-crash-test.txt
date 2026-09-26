@@ -1,0 +1,13 @@
+07:40:57 pushed 20 jobs (run r20260926T074057430) via 127.0.0.1; jobs=19
+07:40:57 in processing: r20260926T074057430-00001 
+07:40:57 SIGKILL worker process of worker-96b596f77-pxkf5 on node keda-redis-worker (like an OOM kill)
+--- after the queue drains, before the reaper:
+run=r20260926T074057430 expected=20 done=19 jobs=0 processing=1
+FAIL: done (19) != expected (20)
+FAIL: 1 jobs stuck in processing:
+  r20260926T074057430-00001
+--- waiting for the reaper (runs every minute, re-queues after 45s):
+[pod/reaper-29840142-x28jk/reaper] 07:42:00 re-queued:
+[pod/reaper-29840142-x28jk/reaper] r20260926T074057430-00001
+run=r20260926T074057430 expected=20 done=20 jobs=0 processing=0
+PASS
