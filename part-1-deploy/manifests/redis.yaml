@@ -1,0 +1,76 @@
+# Redis 7 as a plain Deployment behind a ClusterIP Service.
+# The password comes from the 'redis-auth' Secret (created by scripts/deploy.sh).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  labels:
+    app: redis
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      containers:
+        - name: redis
+          image: redis:7
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: redis-auth
+                  key: password
+          # The password goes into a private config file rather than the
+          # command line, so it doesn't show up in the process list. 'exec'
+          # makes redis-server PID 1 so it receives SIGTERM directly.
+          # Persistence is off: this is a demo queue, and a Redis restart
+          # loses its contents (see README).
+          command: ["sh", "-c"]
+          args:
+            - |
+              umask 077
+              printf 'requirepass %s\nsave ""\nappendonly no\n' "$REDIS_PASSWORD" > /tmp/redis.conf
+              exec redis-server /tmp/redis.conf
+          ports:
+            - name: redis
+              containerPort: 6379
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - REDISCLI_AUTH="$REDIS_PASSWORD" redis-cli --no-auth-warning ping | grep -q PONG
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            timeoutSeconds: 2
+          livenessProbe:
+            tcpSocket:
+              port: redis
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  labels:
+    app: redis
+spec:
+  selector:
+    app: redis
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis

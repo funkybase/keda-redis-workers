@@ -1,0 +1,17 @@
+$ ./scripts/producer.sh 20
+06:15:34 pushed 20 jobs (run r20260926T061534); jobs=19
+$ ./scripts/check.sh --wait
+06:15:34 done=0 jobs=19 processing=1
+06:15:39 done=2 jobs=16 processing=2
+06:15:44 done=4 jobs=14 processing=2
+06:15:49 done=6 jobs=12 processing=2
+06:15:54 done=10 jobs=8 processing=2
+06:16:00 done=13 jobs=5 processing=2
+06:16:05 done=15 jobs=3 processing=2
+06:16:10 done=18 jobs=0 processing=2
+06:16:15 done=20 jobs=0 processing=0
+06:16:20 done=20 jobs=0 processing=0
+06:16:25 done=20 jobs=0 processing=0
+06:16:30 done=20 jobs=0 processing=0
+run=r20260926T061534 expected=20 done=20 jobs=0 processing=0
+PASS

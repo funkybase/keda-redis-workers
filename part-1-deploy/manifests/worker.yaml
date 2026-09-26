@@ -1,0 +1,57 @@
+# Worker: runs worker/worker.sh (mounted from the generated 'worker-script'
+# ConfigMap) in the stock redis:7 image, so no image build is needed.
+# Redis host comes from the 'worker-config' ConfigMap, password from the
+# 'redis-auth' Secret.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: worker-config
+data:
+  REDIS_HOST: redis.ingest.svc.cluster.local
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+  labels:
+    app: worker
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: worker
+  template:
+    metadata:
+      labels:
+        app: worker
+    spec:
+      containers:
+        - name: worker
+          image: redis:7
+          command: ["bash", "/scripts/worker.sh"]
+          env:
+            - name: REDIS_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: worker-config
+                  key: REDIS_HOST
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: redis-auth
+                  key: password
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+              readOnly: true
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+      volumes:
+        - name: scripts
+          configMap:
+            name: worker-script

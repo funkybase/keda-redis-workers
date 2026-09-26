@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Usage: producer.sh N [--force]
+# Usage: producer.sh N [--force] [--mode exec|pod]
 #
 # Pushes N unique job IDs onto the 'jobs' list. IDs look like
 # <run-id>-<seq>, e.g. r20260926T134501-00042, so they are unique within and
@@ -10,38 +10,56 @@
 #
 # Refuses to start if 'jobs' or 'processing' still hold anything from a
 # previous run (that would make done == N meaningless); --force overrides.
+#
+# --mode (or PRODUCER_MODE) picks where the push runs:
+#   exec  (default) inside the Redis pod via `kubectl exec`, talking to localhost
+#   pod   in a throwaway pod that connects through the 'redis' Service, with
+#         REDIS_HOST from the worker-config ConfigMap and the password from the
+#         redis-auth Secret, i.e. the same path the workers use
+# Both modes run scripts/producer-core.sh, so they behave identically.
 set -euo pipefail
 source "$(dirname "$0")/lib.sh"
 
-N="${1:-}"
-FORCE="${2:-}"
-if ! [[ "$N" =~ ^[1-9][0-9]*$ ]]; then
-  echo "usage: $0 N [--force]" >&2
-  exit 2
-fi
+usage() { echo "usage: $0 N [--force] [--mode exec|pod]" >&2; exit 2; }
 
-queued=$(rcli LLEN jobs)
-inflight=$(rcli LLEN processing)
-if [ "$FORCE" != "--force" ] && { [ "$queued" -ne 0 ] || [ "$inflight" -ne 0 ]; }; then
-  echo "refusing: jobs=$queued processing=$inflight from a previous run (use --force)" >&2
-  exit 1
-fi
+N="" FORCE="" MODE="${PRODUCER_MODE:-exec}"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --force) FORCE="--force" ;;
+    --mode) MODE="${2:-}"; shift ;;
+    --mode=*) MODE="${1#--mode=}" ;;
+    *) [ -z "$N" ] || usage; N="$1" ;;
+  esac
+  shift
+done
+[[ "$N" =~ ^[1-9][0-9]*$ ]] || usage
 
+CORE="$(dirname "$0")/producer-core.sh"
 RUN_ID="r$(date -u +%Y%m%dT%H%M%S)"
-CHUNK=500 # IDs per RPUSH, keeps each command line a sane size
 
-{
-  echo "MULTI"
-  echo "SET done 0"
-  echo "SET expected $N"
-  echo "SET run_id $RUN_ID"
-  for ((start = 1; start <= N; start += CHUNK)); do
-    end=$((start + CHUNK - 1)); ((end > N)) && end=$N
-    printf 'RPUSH jobs'
-    for ((i = start; i <= end; i++)); do printf ' %s-%05d' "$RUN_ID" "$i"; done
-    printf '\n'
-  done
-  echo "EXEC"
-} | rcli >/dev/null
-
-echo "$(date -u +%H:%M:%S) pushed $N jobs (run $RUN_ID); jobs=$(rcli LLEN jobs)"
+case "$MODE" in
+  exec)
+    kubectl -n "$NAMESPACE" exec -i "$REDIS_TARGET" -c redis -- \
+      bash -s -- "$N" "$RUN_ID" "$FORCE" <"$CORE"
+    ;;
+  pod)
+    # kubectl run replaces the whole container list with --overrides, so the
+    # container is spelled out in full (stdin for the script, env, resources).
+    overrides=$(cat <<EOF
+{"spec":{"containers":[{
+  "name":"producer","image":"redis:7",
+  "command":["bash","-s","--","$N","$RUN_ID","$FORCE"],
+  "stdin":true,"stdinOnce":true,
+  "env":[
+    {"name":"REDIS_HOST","valueFrom":{"configMapKeyRef":{"name":"worker-config","key":"REDIS_HOST"}}},
+    {"name":"REDIS_PASSWORD","valueFrom":{"secretKeyRef":{"name":"redis-auth","key":"password"}}}
+  ],
+  "resources":{"requests":{"cpu":"10m","memory":"16Mi"},"limits":{"cpu":"200m","memory":"64Mi"}}
+}]}}
+EOF
+)
+    kubectl -n "$NAMESPACE" run "producer-$(date +%s)" --quiet -i --rm \
+      --restart=Never --image=redis:7 --overrides="$overrides" <"$CORE"
+    ;;
+  *) usage ;;
+esac

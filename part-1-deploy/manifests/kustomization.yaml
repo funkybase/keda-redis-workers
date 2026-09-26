@@ -1,0 +1,14 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: ingest
+
+resources:
+  - redis.yaml
+  - worker.yaml
+
+# The worker script lives in worker/worker.sh as a normal file. Kustomize adds a
+# content hash to the ConfigMap name, so editing the script rolls the workers.
+configMapGenerator:
+  - name: worker-script
+    files:
+      - worker.sh=../worker/worker.sh
