@@ -1,0 +1,44 @@
+# Scales the worker Deployment on the length of the 'jobs' list.
+#
+#   0 -> 1   the KEDA operator polls the list every pollingInterval and
+#            scales the Deployment to 1 itself as soon as it is non-empty.
+#   1 -> N   the HPA that KEDA creates targets listLength jobs per replica:
+#            desired = ceil(len(jobs) / listLength), capped at maxReplicaCount.
+#   N -> 0   after the list has been empty for cooldownPeriod.
+#
+# The timings are much shorter than KEDA's defaults (30s poll, 300s cooldown,
+# 300s HPA scale-down window) so scaling is visible within a short demo run.
+# That also means KEDA scales down while jobs are still in flight, which is
+# exactly what Part 3 examines.
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: worker
+spec:
+  scaleTargetRef:
+    name: worker
+  minReplicaCount: 0
+  maxReplicaCount: 10
+  pollingInterval: 5
+  cooldownPeriod: 30
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 15
+          policies:
+            - type: Percent
+              value: 100
+              periodSeconds: 15
+  triggers:
+    - type: redis
+      metadata:
+        # Resolved from the worker container's env, i.e. the worker-config
+        # ConfigMap, so the Redis host is defined in one place.
+        hostFromEnv: REDIS_HOST
+        port: "6379"
+        listName: jobs
+        listLength: "5"           # target jobs waiting per replica
+        activationListLength: "0" # any queued job wakes the worker from 0
+      authenticationRef:
+        name: redis-auth

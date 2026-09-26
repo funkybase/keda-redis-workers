@@ -1,0 +1,19 @@
+# Part 2 = Part 1 + KEDA autoscaling. Only the overrides live here.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: ingest
+
+resources:
+  - ../../part-1-deploy/manifests
+  - triggerauthentication.yaml
+  - scaledobject.yaml
+
+patches:
+  # KEDA (via its HPA) owns the replica count now. Leaving 'replicas' in the
+  # manifest would make every `kubectl apply` reset it.
+  - target:
+      kind: Deployment
+      name: worker
+    patch: |-
+      - op: remove
+        path: /spec/replicas

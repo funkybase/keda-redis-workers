@@ -16,6 +16,7 @@ scripts/producer.sh                push N unique job IDs onto 'jobs' (--mode exe
 scripts/producer-core.sh           the push logic, run inside a container by producer.sh
 scripts/check.sh                   verify a run: done == N, 'jobs' and 'processing' empty
 scripts/lib.sh                     shared redis-cli-over-kubectl-exec helper
+scripts/watch-replicas.sh          record worker replicas + queue state over time
 evidence/                          captured output from the runs below
 
 part-1-deploy/
@@ -24,6 +25,11 @@ part-1-deploy/
   manifests/worker.yaml            worker-config ConfigMap (REDIS_HOST) + worker Deployment
   worker/worker.sh                 the worker loop (mounted into the stock redis:7 image)
   scripts/deploy.sh                create the redis-auth Secret, apply a kustomization (default: Part 1)
+
+part-2-autoscale/manifests/        overrides on Part 1
+  kustomization.yaml               Part 1 + the files below; drops the worker's fixed replicas
+  triggerauthentication.yaml       KEDA gets the Redis password from the redis-auth Secret
+  scaledobject.yaml                redis list trigger on 'jobs', 0-10 replicas
 ```
 
 ## Prerequisites
@@ -144,6 +150,110 @@ PASS
 ```
 
 `processing` never goes above 2: one in-flight job per worker.
+
+## Part 2: Autoscale with KEDA
+
+```bash
+./part-1-deploy/scripts/deploy.sh part-2-autoscale/manifests
+./scripts/watch-replicas.sh &      # record replicas + queue every 3s
+./scripts/producer.sh 200
+```
+
+**1. ScaledObject + TriggerAuthentication.** [part-2-autoscale/manifests/](part-2-autoscale/manifests/)
+only holds overrides on Part 1:
+- [scaledobject.yaml](part-2-autoscale/manifests/scaledobject.yaml): a `redis`
+  trigger on list `jobs` for the `worker` Deployment, 0 to 10 replicas, with a
+  target of `listLength: 5` queued jobs per replica.
+  - The Redis host comes from the worker container's `REDIS_HOST` (via
+    `hostFromEnv`), so it stays defined only in the `worker-config` ConfigMap.
+- [triggerauthentication.yaml](part-2-autoscale/manifests/triggerauthentication.yaml):
+  maps the scaler's `password` parameter to the existing `redis-auth` Secret.
+  No credentials are in the ScaledObject.
+- The kustomization removes `replicas: 2` from the worker Deployment. Once KEDA
+  owns the replica count, a fixed value would be reapplied on every
+  `kubectl apply`.
+
+Timings are shortened from KEDA's defaults so scaling shows up within a short
+run:
+
+| Setting | Here | KEDA default |
+|---------|------|--------------|
+| `pollingInterval` | 5s | 30s |
+| `cooldownPeriod` | 30s | 300s |
+| HPA scale-down stabilization window | 15s | 300s |
+
+**2. Replica count while 200 jobs drain** ([evidence/part2-replicas-200.txt](evidence/part2-replicas-200.txt)).
+`spec` is the replica count KEDA/the HPA asked for, `ready` is Ready pods,
+`pods` includes Terminating ones. Some rows are omitted:
+
+```
+time       t+s  spec ready  pods  jobs processing  done
+06:59:40     4     0     0     0     0          0    30   <- idle at 0 replicas ('done' is from an earlier run)
+06:59:43     7     0     0     0   200          0     0   <- producer pushes 200
+06:59:50    14     1     1     1   199          1     0   <- KEDA operator: 0 -> 1
+06:59:54    18     5     3     5   194          5     1   <- HPA: 1 -> 5
+07:00:11    35    10    10    10   164         10    26   <- HPA: 5 -> 10 (max)
+07:00:52    76    10    10    10    42         10   148
+07:00:55    79     8     8    10    30         10   160   <- HPA scales down; queue shrinking
+07:01:09    93     1     1    10     0          2   198   <- queue empty, 9 pods still Terminating
+07:01:12    96     1     1    10     0          0   200
+07:01:26   110     1     1     8     0          0   200
+07:01:36   120     0     0     8     0          0   200   <- KEDA operator: 1 -> 0 after 30s cooldown
+07:02:07   151     0     0     0     0          0   200
+run=r20260926T065943 expected=200 done=200 jobs=0 processing=0
+PASS
+```
+
+In total: 0 → 1 → 5 → 10 → 8 → 1 → 0. The 200 jobs finished about 90s after
+being pushed, and the check passes.
+
+### How does the worker get from 0 to 1 replica, and from 1 to N?
+
+KEDA splits the job between two components, because a Kubernetes HPA cannot
+scale a workload to or from zero. Its `minReplicas` is at least 1.
+
+**0 → 1: the KEDA operator.**
+1. Every `pollingInterval` (5s here), `keda-operator` runs the Redis scaler,
+   authenticating with the TriggerAuthentication. The scaler runs `LLEN jobs`.
+2. If the length is above `activationListLength` (0), the ScaledObject becomes
+   Active.
+3. If the Deployment is at 0, the operator itself patches it to 1 replica
+   (`minReplicaCount` is 0, so 1 is the next step up).
+
+In the run above the operator went from 0 to 1 about 7s after the push: up to
+one polling interval, plus pod scheduling and startup.
+
+**1 → N: the HPA that KEDA manages.**
+1. When the ScaledObject is created, KEDA creates an HPA, `keda-hpa-worker`
+   (`kubectl -n ingest get hpa`). Its target is an External metric,
+   `s0-redis-jobs`, with an average value of 5 per pod.
+2. The metric is served by `keda-operator-metrics-apiserver`, which KEDA
+   registers as the cluster's `external.metrics.k8s.io` API. That server asks the
+   operator, and the operator runs the scaler (`LLEN jobs`).
+3. Every 15s, the kube-controller-manager's HPA controller reads the metric and
+   computes `desired = ceil(LLEN(jobs) / 5)`, clamped to 1 to 10. With 200
+   queued, that's ceil(40) → 10.
+4. It rises in steps rather than jumping straight there, because of the HPA's
+   default scale-up policy: at most +100% or +4 pods, whichever is larger, per
+   15s. That gives the observed 1 → 5 → 10.
+
+**N → 1 → 0.**
+- Down to 1: the HPA lowers the replica count as the queue shrinks, after the
+  15s stabilization window.
+- To 0: once the list has been empty for `cooldownPeriod` (30s), the operator
+  sets the Deployment to 0. In the run, the queue was empty at about t=93s and
+  the worker was at 0 by t=120s.
+
+**What the metric doesn't count.** The trigger only sees `jobs`, not
+`processing`. The last jobs are still being worked on when the HPA sees an
+almost empty queue, so it scales down while jobs are in flight. In this run the
+HPA dropped to 8 and then 1 replica while `processing` was still 10.
+
+Those pods then stayed Terminating (`pods` column) for about 30s. The stub runs
+as `bash` PID 1, which ignores SIGTERM, so they kept looping until the kubelet
+SIGKILLed them at the end of the 30s grace period. Here the queue had already
+drained before the kills, so nothing was lost. Part 3 shows what happens when it
+hasn't.
 
 ## Tear down
 
